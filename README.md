@@ -92,13 +92,21 @@ docker compose run --rm verify
 单次执行，退出码即结论，依次完成：
 
 1. **构建检查** — `compileall` 字节码编译全部源码/测试/脚本；
-2. **代码测试** — 27 个 `unittest` 用例（帧编码、截尾恢复、损坏隔离、
-   并发抢占、游标分页、HTTP 503）；
+2. **代码测试** — 33 个 `unittest` 用例（帧编码、满批重启持久化、截尾
+   恢复、损坏隔离、并发抢占、游标分页、HTTP 503）；
 3. **HTTP 冒烟** — `tests/e2e_smoke.py` 驱动真实服务子进程证明：
+   - 满 32 条接近 int64 上界的剂量批次提交 201 后重启服务：序号 1–32
+     连续可读、`next_seq` 保持 33、以 33 追加成功、分页不跳号不重复；
    - 写入途中 `os._exit` 杀死写入进程 → 重启物理截去半帧、序号连续重建；
    - 翻转完整帧内字节 → 重启后 health/读/写全部 503（poisoned 隔离）；
    - 16 客户端同序号 HTTP 并发 → 恰 1 个 201、15 个 409，WAL 精确增长
      一个帧（败者不留字节、不占序号）；
    - 并对 compose 中运行中的 ledger 容器再做一次 HTTP 提交+回读冒烟。
+
+随后在 ledger 服务健康的前提下，`scripts/http_smoke.py` 对 compose
+中的服务以 HTTP 验证同一条链路：满批提交 → 通过 Docker API 重启
+ledger 容器（verify 服务挂载 `/var/run/docker.sock`；socket 缺失时
+跳过该步并明确提示）→ 健康接口保持 `next_seq`、分页连续回读本批 →
+以新头部追加 → 全日志从序号 1 起无跳号、无重复。
 
 本地（无 Docker）可直接运行：`sh scripts/verify.sh`（退出码为 0 即通过）。

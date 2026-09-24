@@ -81,6 +81,46 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(len(frame.records), 32)
         self.assertEqual(self.ledger.head(), 33)
 
+    def test_full_batch_restart_paged_read_and_append(self) -> None:
+        # The reported scenario: a full 32-record batch of doses near the
+        # signed-int64 upper bound commits, the service restarts, and the
+        # batch must still be there -- continuously readable, head kept.
+        records = [2**63 - 1 - i for i in range(32)]
+        frame = self.ledger.submit(1, records)
+        self.assertEqual((frame.seq, self.ledger.head()), (1, 33))
+
+        restarted = self.reopen()
+        self.assertFalse(restarted.poisoned)
+        self.assertEqual(restarted.head(), 33)
+
+        # Page through the batch with a small limit: exactly 1..32 in
+        # order, no gaps, no duplicates.
+        seen: list[int] = []
+        cursor = 0
+        while True:
+            page = restarted.read(cursor, limit=7)
+            seen.extend(r.seq for r in page.records)
+            cursor = page.next_cursor
+            if not page.records:
+                break
+        self.assertEqual(seen, list(range(1, 33)))
+        self.assertEqual(
+            [r.dose for r in restarted.read(0).records], records
+        )
+
+        # Appending at the advertised head succeeds and stays continuous.
+        restarted.submit(33, [42])
+        self.assertEqual(restarted.head(), 34)
+        page = restarted.read(32)
+        self.assertEqual([(r.seq, r.dose) for r in page.records], [(33, 42)])
+
+        # A second restart still sees the whole chain.
+        again = self.reopen()
+        self.assertEqual(again.head(), 34)
+        self.assertEqual(
+            [r.seq for r in again.read(0).records], list(range(1, 34))
+        )
+
     def test_concurrent_same_expected_seq_exactly_one_wins(self) -> None:
         n = 32
         winners: list[int] = []

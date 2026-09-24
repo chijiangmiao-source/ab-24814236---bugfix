@@ -107,16 +107,7 @@ class HttpTests(unittest.TestCase):
                  {"expected_seq": 1, "records": [5, 6]})
         _request("POST", f"{self.base}/api/batches",
                  {"expected_seq": 3, "records": [7]})
-        self.httpd.shutdown()
-        self.httpd.server_close()
-        self.thread.join(timeout=5)
-
-        self.httpd = build_server("127.0.0.1", 0, self.wal_path)
-        self.port = self.httpd.server_address[1]
-        self.base = f"http://127.0.0.1:{self.port}"
-        self.thread = threading.Thread(target=self.httpd.serve_forever,
-                                       daemon=True)
-        self.thread.start()
+        self._restart()
 
         status, health = _request("GET", f"{self.base}/healthz")
         self.assertEqual(health["next_seq"], 4)
@@ -138,24 +129,70 @@ class HttpTests(unittest.TestCase):
             201,
         )
 
-    def test_poisoned_log_returns_503_for_everything(self) -> None:
-        _request("POST", f"{self.base}/api/batches",
-                 {"expected_seq": 1, "records": [1, 2, 3]})
+    def test_full_batch_restart_then_append_and_pagination(self) -> None:
+        # The reported chain over HTTP: a full 32-record batch of doses
+        # near the int64 upper bound commits, the service restarts, and
+        # the committed batch must page back continuously; the next batch
+        # appends at the advertised head without gaps or duplicates.
+        records = [2**63 - 1 - i for i in range(32)]
+        status, body = _request(
+            "POST", f"{self.base}/api/batches",
+            {"expected_seq": 1, "records": records},
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(body, {"status": "committed", "seq": 1,
+                                "count": 32, "next_seq": 33})
+
+        self._restart()
+
+        status, health = _request("GET", f"{self.base}/healthz")
+        self.assertEqual((status, health["next_seq"]), (200, 33))
+
+        seen: list[dict] = []
+        cursor = 0
+        while True:
+            status, page = _request(
+                "GET", f"{self.base}/api/records?cursor={cursor}&limit=7"
+            )
+            self.assertEqual(status, 200)
+            seen.extend(page["records"])
+            cursor = page["next_cursor"]
+            if not page["records"]:
+                break
+        self.assertEqual([r["seq"] for r in seen], list(range(1, 33)))
+        self.assertEqual([r["dose"] for r in seen], records)
+
+        status, body = _request(
+            "POST", f"{self.base}/api/batches",
+            {"expected_seq": 33, "records": [-1]},
+        )
+        self.assertEqual((status, body["seq"], body["next_seq"]),
+                         (201, 33, 34))
+        _, page = _request("GET", f"{self.base}/api/records?cursor=32")
+        self.assertEqual(page["records"], [{"seq": 33, "dose": -1}])
+
+    def _restart(self) -> None:
+        """Bounce the service on the same WAL file (a service restart)."""
         self.httpd.shutdown()
         self.httpd.server_close()
         self.thread.join(timeout=5)
-
-        data = bytearray(open(self.wal_path, "rb").read())
-        data[24] ^= 0xFF  # flip a payload byte
-        with open(self.wal_path, "wb") as fh:
-            fh.write(data)
-
         self.httpd = build_server("127.0.0.1", 0, self.wal_path)
         self.port = self.httpd.server_address[1]
         self.base = f"http://127.0.0.1:{self.port}"
         self.thread = threading.Thread(target=self.httpd.serve_forever,
                                        daemon=True)
         self.thread.start()
+
+    def test_poisoned_log_returns_503_for_everything(self) -> None:
+        _request("POST", f"{self.base}/api/batches",
+                 {"expected_seq": 1, "records": [1, 2, 3]})
+        # Corrupt a payload byte of the committed frame, then restart: the
+        # damage is only visible to a fresh scan of the file.
+        data = bytearray(open(self.wal_path, "rb").read())
+        data[24] ^= 0xFF
+        with open(self.wal_path, "wb") as fh:
+            fh.write(data)
+        self._restart()
 
         self.assertEqual(_request("GET", f"{self.base}/healthz")[0], 503)
         self.assertEqual(

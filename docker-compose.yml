@@ -29,12 +29,20 @@ services:
         condition: service_healthy
     environment:
       LEDGER_BASE_URL: http://ledger:8080
+      # Lets the verify service restart the ledger container mid-check to
+      # prove over HTTP that committed batches survive a service restart.
+      # If the socket is absent (e.g. rootless docker), http_smoke skips
+      # just that leg; the subprocess e2e still covers restart persistence.
+      LEDGER_RESTART_CONTAINER: dose-ledger
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     # This one-shot container runs no server; disable the image healthcheck.
     healthcheck:
       disable: true
     # Runs: compile/build check -> unit tests -> lifecycle proof
-    # (torn-tail truncation, corruption isolation, concurrent preemption)
-    # -> HTTP smoke against the ledger service. Exit code is the verdict.
+    # (full-batch restart persistence, torn-tail truncation, corruption
+    # isolation, concurrent preemption) -> HTTP smoke against the ledger
+    # service, including a container restart. Exit code is the verdict.
     entrypoint: ["sh", "scripts/verify.sh"]
     restart: "no"
 

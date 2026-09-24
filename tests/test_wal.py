@@ -11,6 +11,8 @@ from app.wal import (
     DIGEST_LEN,
     HEADER_LEN,
     MAGIC,
+    MAX_RECORDS,
+    RECOVERY_CHUNK_BYTES,
     PoisonedError,
     WAL,
     canonical_payload,
@@ -144,6 +146,95 @@ class AppendRecoveryTests(_TempWal):
         self.assertEqual(recover(self.path).frames, [])
         self.write_raw(b"")
         self.assertEqual(self.open_wal().next_seq, 1)
+
+
+class LargeFrameRecoveryTests(_TempWal):
+    """Frames bigger than one recovery chunk must survive a restart.
+
+    Regression coverage for the reported data loss: a full 32-record batch
+    of doses near the int64 upper bound encodes to a frame far larger than
+    RECOVERY_CHUNK_BYTES; recovery must keep reading until EOF before it
+    may call anything a torn tail.
+    """
+
+    def test_full_batch_of_large_doses_survives_restart(self) -> None:
+        records = [2**63 - 1 - i for i in range(MAX_RECORDS)]
+        wal = self.open_wal()
+        frame = wal.append_batch(records)
+        self.assertEqual((frame.frame_no, frame.seq), (1, 1))
+        self.assertEqual(wal.next_seq, 33)
+        wal.close()
+        self._opened.remove(wal)
+        size = os.path.getsize(self.path)
+        self.assertGreater(size, RECOVERY_CHUNK_BYTES)
+
+        wal2 = self.open_wal()
+        self.assertFalse(wal2.poisoned)
+        self.assertEqual(wal2.truncated_bytes_on_boot, 0)
+        self.assertEqual(wal2.next_seq, 33)
+        # Not a single committed byte may be lost or "repaired" away.
+        self.assertEqual(os.path.getsize(self.path), size)
+        frames = wal2.snapshot()
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0].records, records)
+
+    def test_frames_spanning_chunk_boundaries_survive(self) -> None:
+        wal = self.open_wal()
+        expected: list[list[int]] = []
+        for i in range(6):
+            records = [10**18 + i] * (1 + i % MAX_RECORDS)
+            wal.append_batch(records)
+            expected.append(records)
+        wal.close()
+        self._opened.remove(wal)
+        size = os.path.getsize(self.path)
+        self.assertGreater(size, 2 * RECOVERY_CHUNK_BYTES)
+
+        wal2 = self.open_wal()
+        self.assertEqual([f.records for f in wal2.snapshot()], expected)
+        self.assertEqual(
+            wal2.next_seq, 1 + sum(len(r) for r in expected)
+        )
+        self.assertEqual(os.path.getsize(self.path), size)
+
+    def test_torn_tail_after_large_frame_is_truncated(self) -> None:
+        wal = self.open_wal()
+        wal.append_batch([2**63 - 1] * MAX_RECORDS)
+        wal.close()
+        self._opened.remove(wal)
+        good_size = os.path.getsize(self.path)
+        self.assertGreater(good_size, RECOVERY_CHUNK_BYTES)
+        # A crash interrupts the next append after 100 bytes of a frame
+        # that would itself span several recovery chunks.
+        torn = encode_frame(2, canonical_payload([2**63 - 2] * MAX_RECORDS))
+        with open(self.path, "ab") as fh:
+            fh.write(torn[:100])
+
+        wal2 = self.open_wal()
+        self.assertFalse(wal2.poisoned)
+        self.assertEqual(wal2.truncated_bytes_on_boot, 100)
+        self.assertEqual(os.path.getsize(self.path), good_size)
+        self.assertEqual(wal2.next_seq, 33)
+        # The log is usable again and numbering continues seamlessly.
+        frame = wal2.append_batch([7])
+        self.assertEqual((frame.frame_no, frame.seq), (2, 33))
+
+    def test_mid_log_corruption_past_chunk_boundary_poisons(self) -> None:
+        wal = self.open_wal()
+        wal.append_batch([2**63 - 1] * MAX_RECORDS)  # big first frame
+        wal.append_batch([1])
+        wal.close()
+        self._opened.remove(wal)
+        size_before = os.path.getsize(self.path)
+        data = self.raw()
+        # Inflate frame 1's length so it logically swallows frame 2; the
+        # damage only becomes visible well past the first recovery chunk,
+        # and must poison -- never truncate the confirmed frames away.
+        data[16:24] = (9_000_000).to_bytes(8, "big")
+        self.write_raw(bytes(data))
+        wal2 = self.assert_reopen_poisoned()
+        self.assertIn("mid-log", wal2.poison_reason or "")
+        self.assertEqual(os.path.getsize(self.path), size_before)
 
 
 class CorruptionIsolationTests(_TempWal):

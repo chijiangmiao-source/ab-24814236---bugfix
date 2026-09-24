@@ -4,15 +4,19 @@ It drives a *real* server subprocess through the full lifecycle:
 
   1. healthy start on an empty log
   2. batch commit + cursor pagination over HTTP
-  3. torn-write recovery: a writer process is killed (``os._exit``) after
+  3. full-batch restart persistence: a 32-record batch of doses near the
+     int64 upper bound commits over HTTP; the service is restarted and the
+     batch must page back continuously (seq 1..32, next_seq 33 kept), then
+     accept the next batch at 33 without gaps or duplicates
+  4. torn-write recovery: a writer process is killed (``os._exit``) after
      emitting only part of a frame; restart must truncate the tail and
      rebuild the continuous sequence
-  4. corruption isolation: a byte is flipped inside a *complete* frame;
+  5. corruption isolation: a byte is flipped inside a *complete* frame;
      restart must serve 503 on health, reads and appends (poisoned)
-  5. concurrent preemption over HTTP: N clients submit the same
+  6. concurrent preemption over HTTP: N clients submit the same
      ``expected_seq``; exactly one gets 201, all others 409, and the WAL
      grows by exactly one frame -- no loser bytes, no consumed numbers
-  6. if LEDGER_BASE_URL is set (docker compose), also smoke that instance
+  7. if LEDGER_BASE_URL is set (docker compose), also smoke that instance
 
 Exit status is non-zero if any constraint is violated, so a CI/compose
 "verify" service's exit code is the evidence.
@@ -164,7 +168,59 @@ def main() -> int:
     finally:
         stop_server(proc)
 
-    section("3. writer killed mid frame -> torn tail truncated on restart")
+    section("3. full 32-record batch survives a service restart")
+    # The reported incident: a full batch of doses near the signed-int64
+    # upper bound commits (201), the service restarts, and the batch must
+    # still be there -- next_seq kept at 33, records 1..32 readable.
+    restart_wal = os.path.join(tmp, "wal-restart.bin")
+    big_batch = [2**63 - 1 - i for i in range(32)]
+    proc, base = start_server(restart_wal)
+    try:
+        status, body = request(
+            "POST", f"{base}/api/batches",
+            {"expected_seq": 1, "records": big_batch})
+        assert status == 201, body
+        assert body == {"status": "committed", "seq": 1, "count": 32,
+                        "next_seq": 33}, body
+        size_committed = os.path.getsize(restart_wal)
+    finally:
+        stop_server(proc)
+    assert os.path.getsize(restart_wal) == size_committed
+
+    proc, base = start_server(restart_wal)
+    try:
+        status, body = request("GET", f"{base}/healthz")
+        assert status == 200 and body["next_seq"] == 33, body
+        assert os.path.getsize(restart_wal) == size_committed, \
+            "restart must not truncate committed frames"
+        # Page the committed batch back with a small page size: exactly
+        # seq 1..32 in order, no gaps, no duplicates.
+        seen = []
+        cursor = 0
+        while True:
+            q = urlencode({"cursor": cursor, "limit": 7})
+            status, page = request("GET", f"{base}/api/records?{q}")
+            assert status == 200, page
+            seen.extend(page["records"])
+            cursor = page["next_cursor"]
+            if not page["records"]:
+                break
+        assert [r["seq"] for r in seen] == list(range(1, 33)), seen
+        assert [r["dose"] for r in seen] == big_batch, seen
+        # The next batch commits at the advertised head, continuously.
+        status, body = request(
+            "POST", f"{base}/api/batches",
+            {"expected_seq": 33, "records": [-1, -2]})
+        assert status == 201 and body["seq"] == 33 \
+            and body["next_seq"] == 35, body
+        status, page = request("GET", f"{base}/api/records?cursor=32")
+        assert [(r["seq"], r["dose"]) for r in page["records"]] == \
+            [(33, -1), (34, -2)], page
+        print("restart kept seq 1..32 and next_seq=33; append at 33 ok")
+    finally:
+        stop_server(proc)
+
+    section("4. writer killed mid frame -> torn tail truncated on restart")
     # A real crashed append always carried the correct next frame ordinal
     # (two committed frames -> frame 3); only its trailing bytes are missing.
     killer_code = (
@@ -198,7 +254,7 @@ def main() -> int:
     finally:
         stop_server(proc)
 
-    section("4. corruption inside a complete frame -> poisoned (503 only)")
+    section("5. corruption inside a complete frame -> poisoned (503 only)")
     data = bytearray(open(wal_path, "rb").read())
     # Flip a payload byte of the very first frame, well before EOF.
     data[HEADER_LEN + 1] ^= 0xFF
@@ -228,7 +284,7 @@ def main() -> int:
     # Restore a clean log for the concurrency phase: rebuild from scratch.
     os.unlink(wal_path)
 
-    section("5. HTTP concurrent preemption: one winner, zero loser bytes")
+    section("6. HTTP concurrent preemption: one winner, zero loser bytes")
     proc, base = start_server(wal_path)
     try:
         n = 16
@@ -274,7 +330,7 @@ def main() -> int:
 
     external = os.environ.get("LEDGER_BASE_URL")
     if external:
-        section(f"6. external smoke against {external}")
+        section(f"7. external smoke against {external}")
         body = wait_ready(external, expect_status=200)
         status, body = request("POST", f"{external}/api/batches", {
             "expected_seq": body["next_seq"],
