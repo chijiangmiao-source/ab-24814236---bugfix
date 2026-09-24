@@ -61,10 +61,6 @@ class PoisonedError(RuntimeError):
     """The WAL is structurally corrupted and may not be appended/read."""
 
 
-class TruncatedTail(Exception):
-    """Raised internally while scanning: the file ends mid-frame."""
-
-
 def canonical_payload(records: List[int]) -> bytes:
     """Canonical payload for a batch.
 
@@ -168,14 +164,6 @@ def _scan_available(
     return frames, pos, False
 
 
-def _scan(data: bytes) -> List[Frame]:
-    """Parse all frames from ``data``; raise TruncatedTail on a torn tail."""
-    frames, consumed, incomplete = _scan_available(data, [])
-    if incomplete:
-        raise TruncatedTail(consumed)
-    return frames
-
-
 def recover(path: str) -> RecoveryResult:
     """Open/recover a WAL file.
 
@@ -187,31 +175,30 @@ def recover(path: str) -> RecoveryResult:
 
     frames: List[Frame] = []
     buffered = b""
-    scanned = 0
-    try:
-        with open(path, "rb") as fh:
-            while chunk := fh.read(RECOVERY_CHUNK_BYTES):
-                buffered += chunk
-                parsed, consumed, incomplete = _scan_available(
-                    buffered, frames
-                )
-                if incomplete:
-                    raise TruncatedTail(scanned + consumed)
-                frames = parsed
-                buffered = buffered[consumed:]
-                scanned += consumed
-    except TruncatedTail as torn:
-        cut = torn.args[0]
-        size = os.path.getsize(path)
-        removed = size - cut
-        # Rewrite the file to exactly its valid prefix, durably.
-        with open(path, "r+b") as fh:
-            fh.truncate(cut)
-            fh.flush()
-            os.fsync(fh.fileno())
-        _fsync_dir(os.path.dirname(path) or ".")
-        return RecoveryResult(frames=frames, truncated_bytes=removed)
-    return RecoveryResult(frames=frames, truncated_bytes=0)
+    scanned = 0  # absolute file offset of buffered[0]
+    with open(path, "rb") as fh:
+        while chunk := fh.read(RECOVERY_CHUNK_BYTES):
+            buffered += chunk
+            # An incomplete frame here only means the buffer ends mid-frame
+            # (frames routinely span chunk boundaries); it is a torn tail
+            # solely if it is *still* incomplete at EOF.  Structural damage
+            # raises PoisonedError as soon as the bytes proving it are read.
+            frames, consumed, _incomplete = _scan_available(buffered, frames)
+            buffered = buffered[consumed:]
+            scanned += consumed
+    if not buffered:
+        return RecoveryResult(frames=frames, truncated_bytes=0)
+    # EOF reached with unconsumed bytes: exactly one incomplete frame (or
+    # header fragment) at the physical end of the file -- the append a crash
+    # interrupted.  Physically truncate the file to the valid prefix, durably.
+    cut = scanned
+    removed = len(buffered)
+    with open(path, "r+b") as fh:
+        fh.truncate(cut)
+        fh.flush()
+        os.fsync(fh.fileno())
+    _fsync_dir(os.path.dirname(path) or ".")
+    return RecoveryResult(frames=frames, truncated_bytes=removed)
 
 
 def _fsync_dir(directory: str) -> None:

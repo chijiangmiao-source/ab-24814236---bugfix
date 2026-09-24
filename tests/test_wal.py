@@ -11,6 +11,7 @@ from app.wal import (
     DIGEST_LEN,
     HEADER_LEN,
     MAGIC,
+    RECOVERY_CHUNK_BYTES,
     PoisonedError,
     WAL,
     canonical_payload,
@@ -144,6 +145,79 @@ class AppendRecoveryTests(_TempWal):
         self.assertEqual(recover(self.path).frames, [])
         self.write_raw(b"")
         self.assertEqual(self.open_wal().next_seq, 1)
+
+    def test_full_batch_frame_spanning_chunks_survives_restart(self) -> None:
+        # Regression: a maximal 32-record batch of int64-scale doses encodes
+        # to a frame far larger than one recovery chunk.  Recovery must read
+        # past chunk boundaries instead of mistaking the frame for a torn
+        # tail and truncating the committed batch away.
+        records = [2**63 - 1 - i for i in range(32)]
+        wal = self.open_wal()
+        frame = wal.append_batch(records)
+        self.assertEqual((frame.frame_no, frame.seq), (1, 1))
+        self.assertEqual(wal.next_seq, 33)
+        wal.close()
+        self._opened.remove(wal)
+        size = os.path.getsize(self.path)
+        self.assertGreater(size, RECOVERY_CHUNK_BYTES)
+
+        wal2 = self.open_wal()
+        self.assertFalse(wal2.poisoned)
+        self.assertEqual(wal2.truncated_bytes_on_boot, 0)
+        self.assertEqual(os.path.getsize(self.path), size)
+        self.assertEqual(wal2.next_seq, 33)
+        self.assertEqual(
+            [(f.frame_no, f.seq, f.records) for f in wal2.snapshot()],
+            [(1, 1, records)],
+        )
+        # The log keeps accepting batches with continuous numbering.
+        follow = wal2.append_batch([7, 8])
+        self.assertEqual((follow.frame_no, follow.seq), (2, 33))
+        self.assertEqual(wal2.next_seq, 35)
+
+    def test_many_small_frames_crossing_chunk_boundary_survive(self) -> None:
+        # Same regression without large doses: enough small frames that one
+        # of them straddles a recovery-chunk boundary.
+        wal = self.open_wal()
+        batches = [[10 * i, 10 * i + 1, 10 * i + 2] for i in range(10)]
+        for batch in batches:
+            wal.append_batch(batch)
+        wal.close()
+        self._opened.remove(wal)
+        size = os.path.getsize(self.path)
+        self.assertGreater(size, RECOVERY_CHUNK_BYTES)
+
+        wal2 = self.open_wal()
+        self.assertFalse(wal2.poisoned)
+        self.assertEqual(wal2.truncated_bytes_on_boot, 0)
+        self.assertEqual(os.path.getsize(self.path), size)
+        self.assertEqual(wal2.next_seq, 31)
+        self.assertEqual(
+            [f.records for f in wal2.snapshot()], batches
+        )
+
+    def test_torn_tail_after_chunk_spanning_frame_is_truncated(self) -> None:
+        # A genuine crash-interrupted append behind a large committed frame
+        # must still be truncated to the last complete frame boundary.
+        records = [2**63 - 1 - i for i in range(32)]
+        wal = self.open_wal()
+        wal.append_batch(records)
+        wal.close()
+        self._opened.remove(wal)
+        good_size = os.path.getsize(self.path)
+        self.assertGreater(good_size, RECOVERY_CHUNK_BYTES)
+        half = encode_frame(2, canonical_payload([1, 2, 3]))[:40]
+        with open(self.path, "ab") as fh:
+            fh.write(half)
+
+        wal2 = self.open_wal()
+        self.assertFalse(wal2.poisoned)
+        self.assertEqual(wal2.truncated_bytes_on_boot, len(half))
+        self.assertEqual(os.path.getsize(self.path), good_size)
+        self.assertEqual(wal2.next_seq, 33)
+        self.assertEqual(wal2.snapshot()[0].records, records)
+        follow = wal2.append_batch([5])
+        self.assertEqual((follow.frame_no, follow.seq), (2, 33))
 
 
 class CorruptionIsolationTests(_TempWal):

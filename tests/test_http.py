@@ -138,6 +138,76 @@ class HttpTests(unittest.TestCase):
             201,
         )
 
+    def test_full_batch_survives_restart_and_paginates_over_http(self) -> None:
+        # The reported incident, end to end over HTTP: a maximal 32-record
+        # batch of int64-scale doses commits at seq 1, the service restarts,
+        # and health, pagination and the next append must all reflect the
+        # persisted batch -- next_seq stays 33, records 1..32 replay with
+        # no gap or duplicate, and the follow-up batch lands at 33.
+        records = [2**63 - 1 - i for i in range(32)]
+        status, body = _request(
+            "POST", f"{self.base}/api/batches",
+            {"expected_seq": 1, "records": records},
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(
+            body, {"status": "committed", "seq": 1, "count": 32,
+                   "next_seq": 33},
+        )
+        size_after_commit = os.path.getsize(self.wal_path)
+
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=5)
+
+        self.httpd = build_server("127.0.0.1", 0, self.wal_path)
+        self.port = self.httpd.server_address[1]
+        self.base = f"http://127.0.0.1:{self.port}"
+        self.thread = threading.Thread(target=self.httpd.serve_forever,
+                                       daemon=True)
+        self.thread.start()
+
+        # The restart must not have dropped or truncated the committed batch.
+        self.assertEqual(os.path.getsize(self.wal_path), size_after_commit)
+        status, health = _request("GET", f"{self.base}/healthz")
+        self.assertEqual(status, 200)
+        self.assertEqual(health, {"status": "ok", "next_seq": 33})
+
+        # Paginate with a small limit; the replay must be exactly 1..32.
+        seen: list[dict] = []
+        cursor = 0
+        while True:
+            status, page = _request(
+                "GET",
+                f"{self.base}/api/records?cursor={cursor}&limit=9",
+            )
+            self.assertEqual(status, 200)
+            seen.extend(page["records"])
+            if not page["records"]:
+                break
+            cursor = page["next_cursor"]
+        self.assertEqual(
+            seen,
+            [{"seq": i + 1, "dose": records[i]} for i in range(32)],
+        )
+        self.assertEqual(cursor, 32)
+
+        # The next batch appends at the advertised head and stays continuous.
+        status, body = _request(
+            "POST", f"{self.base}/api/batches",
+            {"expected_seq": 33, "records": [-1, 0]},
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual((body["seq"], body["next_seq"]), (33, 35))
+        status, page = _request(
+            "GET", f"{self.base}/api/records?cursor={cursor}"
+        )
+        self.assertEqual(
+            page["records"],
+            [{"seq": 33, "dose": -1}, {"seq": 34, "dose": 0}],
+        )
+        self.assertEqual(page["next_cursor"], 34)
+
     def test_poisoned_log_returns_503_for_everything(self) -> None:
         _request("POST", f"{self.base}/api/batches",
                  {"expected_seq": 1, "records": [1, 2, 3]})

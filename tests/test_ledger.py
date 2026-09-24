@@ -81,6 +81,58 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(len(frame.records), 32)
         self.assertEqual(self.ledger.head(), 33)
 
+    def test_full_batch_restart_then_paginated_read_and_append(self) -> None:
+        # The reported incident chain: a maximal 32-record batch of doses
+        # near the signed-integer upper bound commits with seq 1..32, the
+        # service restarts, and the batch must still be there -- head stays
+        # 33, cursor pagination replays 1..32 with no gap or duplicate, and
+        # the next batch appends at 33.
+        records = [2**63 - 1 - i for i in range(32)]
+        frame = self.ledger.submit(1, records)
+        self.assertEqual((frame.seq, len(frame.records)), (1, 32))
+        self.assertEqual(self.ledger.head(), 33)
+
+        reopened = self.reopen()
+        self.assertFalse(reopened.poisoned)
+        self.assertEqual(reopened.head(), 33)
+
+        # Page through with an awkward small limit to cross frame and page
+        # boundaries; the replay must be exactly seq 1..32 in order.
+        seen: list[tuple[int, int]] = []
+        cursor = 0
+        while True:
+            page = reopened.read(cursor, limit=7)
+            seen.extend((r.seq, r.dose) for r in page.records)
+            if not page.records:
+                break
+            cursor = page.next_cursor
+        self.assertEqual(
+            seen, [(i + 1, records[i]) for i in range(32)]
+        )
+        self.assertEqual(cursor, 32)
+
+        # Appending at the advertised head succeeds and stays continuous.
+        follow = reopened.submit(33, [100, 200])
+        self.assertEqual(follow.seq, 33)
+        self.assertEqual(reopened.head(), 35)
+        tail = reopened.read(cursor)
+        self.assertEqual(
+            [(r.seq, r.dose) for r in tail.records], [(33, 100), (34, 200)]
+        )
+        self.assertEqual(tail.next_cursor, 34)
+        self.assertEqual(reopened.read(34).records, [])
+
+        # And the whole chain survives one more restart.
+        again = self.reopen()
+        self.assertEqual(again.head(), 35)
+        all_records = again.read(0).records
+        self.assertEqual(
+            [r.seq for r in all_records], list(range(1, 35))
+        )
+        self.assertEqual(
+            [r.dose for r in all_records], records + [100, 200]
+        )
+
     def test_concurrent_same_expected_seq_exactly_one_wins(self) -> None:
         n = 32
         winners: list[int] = []

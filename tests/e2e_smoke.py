@@ -9,10 +9,13 @@ It drives a *real* server subprocess through the full lifecycle:
      rebuild the continuous sequence
   4. corruption isolation: a byte is flipped inside a *complete* frame;
      restart must serve 503 on health, reads and appends (poisoned)
-  5. concurrent preemption over HTTP: N clients submit the same
+  5. restart durability: a maximal 32-record batch of int64-scale doses
+     must still read back 1..32 with next_seq 33 after a restart, and the
+     follow-up batch appends at 33 without pagination gaps or duplicates
+  6. concurrent preemption over HTTP: N clients submit the same
      ``expected_seq``; exactly one gets 201, all others 409, and the WAL
      grows by exactly one frame -- no loser bytes, no consumed numbers
-  6. if LEDGER_BASE_URL is set (docker compose), also smoke that instance
+  7. if LEDGER_BASE_URL is set (docker compose), also smoke that instance
 
 Exit status is non-zero if any constraint is violated, so a CI/compose
 "verify" service's exit code is the evidence.
@@ -225,10 +228,78 @@ def main() -> int:
         stop_server(proc)
     assert os.path.getsize(wal_path) == poisoned_size, \
         "poisoned log must not be silently truncated/rewritten"
-    # Restore a clean log for the concurrency phase: rebuild from scratch.
+    # Restore a clean log for later phases: rebuild from scratch.
     os.unlink(wal_path)
 
-    section("5. HTTP concurrent preemption: one winner, zero loser bytes")
+    section("5. full 32-record batch survives a restart, append at 33")
+    # The durability incident over a real process restart: a maximal batch
+    # of doses near the signed-integer upper bound is acknowledged, the
+    # service is restarted, and the batch must still read back 1..32 with
+    # next_seq 33; the next batch appends at 33 and pagination neither
+    # skips nor duplicates a sequence.
+    durable_path = os.path.join(tmp, "durable.bin")
+    big_records = [2**63 - 1 - i for i in range(32)]
+    proc, base = start_server(durable_path)
+    try:
+        status, body = request(
+            "POST", f"{base}/api/batches",
+            {"expected_seq": 1, "records": big_records})
+        assert status == 201 and body == {
+            "status": "committed", "seq": 1, "count": 32,
+            "next_seq": 33}, body
+        committed_size = os.path.getsize(durable_path)
+    finally:
+        stop_server(proc)
+
+    proc, base = start_server(durable_path)
+    try:
+        # The acknowledged frame must be physically and logically intact.
+        assert os.path.getsize(durable_path) == committed_size, \
+            "restart must not truncate committed frames"
+        status, body = request("GET", f"{base}/healthz")
+        assert status == 200 and body == {"status": "ok", "next_seq": 33}, body
+
+        replay: list[dict] = []
+        cursor = 0
+        while True:
+            q = urlencode({"cursor": cursor, "limit": 7})
+            status, page = request("GET", f"{base}/api/records?{q}")
+            assert status == 200, page
+            replay.extend(page["records"])
+            if not page["records"]:
+                break
+            cursor = page["next_cursor"]
+        assert replay == [{"seq": i + 1, "dose": big_records[i]}
+                          for i in range(32)], replay
+        assert cursor == 32
+
+        # Follow-up batch at the advertised head succeeds, stays continuous.
+        follow = [-1, 0, 2**31]
+        status, body = request(
+            "POST", f"{base}/api/batches",
+            {"expected_seq": 33, "records": follow})
+        assert status == 201 and body["next_seq"] == 36, body
+        status, page = request("GET", f"{base}/api/records?cursor=32")
+        assert [(r["seq"], r["dose"]) for r in page["records"]] == [
+            (33, -1), (34, 0), (35, 2**31)], page
+        print("restart kept next_seq=33; 1..32 replayed; append at 33 ok")
+    finally:
+        stop_server(proc)
+
+    # A second restart must still show the complete chain.
+    proc, base = start_server(durable_path)
+    try:
+        status, body = request("GET", f"{base}/healthz")
+        assert status == 200 and body["next_seq"] == 36, body
+        _, page = request("GET", f"{base}/api/records?cursor=0")
+        seqs = [r["seq"] for r in page["records"]]
+        assert seqs == list(range(1, 36)), seqs
+        assert [r["dose"] for r in page["records"]] == big_records + follow
+        print("second restart still shows 1..35 continuous")
+    finally:
+        stop_server(proc)
+
+    section("6. HTTP concurrent preemption: one winner, zero loser bytes")
     proc, base = start_server(wal_path)
     try:
         n = 16
@@ -274,7 +345,7 @@ def main() -> int:
 
     external = os.environ.get("LEDGER_BASE_URL")
     if external:
-        section(f"6. external smoke against {external}")
+        section(f"7. external smoke against {external}")
         body = wait_ready(external, expect_status=200)
         status, body = request("POST", f"{external}/api/batches", {
             "expected_seq": body["next_seq"],
